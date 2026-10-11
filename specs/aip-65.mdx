@@ -1,0 +1,784 @@
+---
+title: "AIP-65: DECISION.md, agentdecision/v1 (typed questions answered by an escalation ladder of judges)"
+description: "Names the decision, a typed question (choice, ordinal or probability; extract reserved) answered by an ordered ladder of interchangeable judges (rules, typed models such as Jev, schema-constrained LLMs, humans), as a first-class primitive. Fixes the question forms and result shapes, the conservative ordinal pick, the Judge contract (kind, forms, exposure class, calibration tag, answer or abstain), the rung modes (decide, bound, verify), the escalation rule, the deterministic floor, per-rung projections and exposure limits, health and budgets, synchronous and durable execution, the decision record, labels and audits, the DECISION.md manifest (kind: decision), the judge registry, and the host surface (decision_run, decision_label, decision_eval, the workflow `decide` step)."
+aip: 65
+status: Draft
+type: Schema
+created: 2026-10-11
+author: Jeremy André <jeremy@agentik.net>
+requires: [1, 2, 15, 57]
+layer: primitives
+package: "@agentproto/runtime"
+ref-impl: https://github.com/agentproto/ts/tree/main/packages/runtime
+---
+
+| Field | Value |
+|---|---|
+| AIP | 65 (provisional, editors assign the final number) |
+| Title | DECISION.md: typed questions answered by an escalation ladder of judges |
+| Author | Jeremy André &lt;jeremy@agentik.net&gt; |
+| Status | Draft |
+| Type | Schema |
+| Requires | [AIP-1](/docs/aip-1) (process), [AIP-2](/docs/aip-2) (template), [AIP-15](/docs/aip-15) (WORKFLOW: the `decide` step and the `suspend` semantics a human rung relies on), [AIP-57](/docs/aip-57) (MODEL-ROUTING: an `llm` rung names its model through a role) |
+| Composes with | [AIP-62](/docs/aip-62) (REVIEW: a decision picks the review binding), [AIP-7](/docs/aip-7) (GOVERNANCE: the human rung's delivery channel), [AIP-61](/docs/aip-61) (INFERENCE: what "local" means for exposure classes), [AIP-16](/docs/aip-16) (IO: the reserved `extract` schema) |
+| Created | 2026-10-11 |
+| Package | `@agentproto/runtime` (engine, judges, registry, record store, tools); `@agentproto/workflow-runtime` (the `decide` step); `@agentproto/cli` (`agentproto decide`) |
+
+## Abstract
+
+A **decision** is a typed question about some input, answered by an
+ordered **ladder** of **judges**. A question has a **form**: `choice`
+(one option from a set), `ordinal` (one level on an ordered scale) or
+`probability` (how likely a statement is true); `extract` is reserved.
+A judge is anything that can answer a form: deterministic **rules**, a
+**typed** model that returns probabilities natively (Jev, a reranker, a
+locally trained classifier head), a schema-constrained **llm**, or a
+**human**. Judges are interchangeable when they support the question's
+form and are allowed to see the rung's data. Each rung either answers
+confidently enough or **abstains**, and an abstention escalates to the
+next rung. Rungs can also **bound** the answer (a lower limit later rungs
+cannot go below) or **verify** an answer already given. A deterministic
+**floor** limits what any judge may decide, an **exposure** limit and a
+**projection** limit what each judge may see, and every decision leaves a
+**record** that later receives ground-truth **labels**, so a ladder can
+be measured and its cheap rungs can take over more of the traffic.
+
+## Motivation
+
+Agent systems keep asking small typed questions: which review tier does
+this git range need, is this idle session done, does this message update
+an existing task or open a new one, which toolsets should this agent load
+at spawn. A general-purpose LLM answers them slowly and expensively, and
+the confidence it writes about itself is not calibrated. Hard-coded rules
+are fast but brittle for anything that needs judgement.
+
+The same answer has been rebuilt independently several times in one
+codebase, with no shared contract:
+
+| Where | What it does | Status |
+|---|---|---|
+| Session steward (`packages/apps/session-steward/.agentproto/workflows/session-steward/`, `agentproto steward`) | classify per idle session with rules and Jev (`minConfidence` 0.8), then an agent analysis that re-checks non-`keep` and low-confidence rows, then rule-based acts gated by `--apply`. Outcomes record `steward-rules | jev | agent | user`. | shipped |
+| A push-gate range router (downstream, `scripts/review/router.mjs`) | skip / standard / deep per git range from path globs and a signal score; a Jev shadow on metadata only behind `GATE_JEV=on` | router shipped; Jev shadow built, never run |
+| A `ProbabilisticOracle` (downstream, graph-orm memory) | `classify`, `rate`, `evaluate`; implementations `jev`, `llm`, `embed` (`head` declared, not implemented). Its LLM implementation asks the model to write its own probabilities, the practice §2 forbids. | shipped |
+| Daemon `packages/runtime/src/jev-client.ts`, a forge adapter | copies of the same Jev `choice` contract | shipped |
+| A messaging triage (downstream, Pygmalion `inbound/triage.ts`) | "link to an existing thread or open a new one" via a light LLM, a deterministic override that always wins, and a quarantined projection of the message | shipped |
+
+They converged on the same ideas (typed questions, probabilities, a
+threshold, a cheaper rung first, fail closed on outage) and diverged on
+names, result shapes, what an outage means, what is logged, and whether
+anything is measured. One downstream message classifier whose silent
+fallback returned a "moderate, no tools" default hid a multi-hour outage,
+because a failed judge looked like a confident "nothing to do".
+
+No existing AIP covers this. AIP-57 resolves a role to a model but has no
+notion of a model that returns typed probabilities. AIP-62 folds a review
+into a verdict and leaves the choice of binding to the host. AIP-15 has
+`branch` and `approval` steps but no step that asks a typed question and
+escalates. AIP-7 escalates to a human operator, not from one model to
+another.
+
+## Design principles
+
+1. **A judge is defined by what it answers and who may see its input,
+   not by what it is.** A typed model and a schema-constrained LLM differ
+   in cost, latency and calibration, not in contract.
+2. **Abstain is not an answer.** A judge that is unsure, unreachable,
+   misconfigured or asked a form it does not support abstains. An
+   abstention escalates; it is never read as the lightest option.
+3. **In doubt, heavier.** For ordered answers, doubt resolves toward the
+   heavier level, never toward the fallback.
+4. **Rules are a floor.** What can be checked exactly is checked exactly,
+   and no judge may decide below it.
+5. **Cheap first, escalate on doubt.**
+6. **What a judge sees is declared and checked at every call.**
+7. **Every decision is measurable**, on an unbiased sample.
+
+## Specification
+
+The key words MUST, MUST NOT, SHOULD, SHOULD NOT and MAY are to be
+interpreted as described in RFC 2119. Canonical JSON and digests use the
+canonicalisation of [AIP-62](/docs/aip-62) §The attestation.
+
+### 1. Questions
+
+```ts
+type QuestionForm = "choice" | "ordinal" | "probability"   // "extract" reserved (§1.4)
+
+interface ChoiceQuestion {
+  form: "choice"
+  instructions: string                    // shown to every judge
+  options?: Record<string, string>        // static: key -> criteria
+  optionsFrom?: {                          // dynamic: options read from the input
+    path: string                           // JSON pointer into the input, e.g. "/candidates"
+    key: string                            // field used as option key, e.g. "id"
+    criteria: string                       // field shown as criteria, e.g. "title"
+    max?: number                           // default 20
+  }
+  sentinels?: Record<string, string>      // static options always present with optionsFrom, e.g. { none: "no candidate fits" }
+}
+
+interface OrdinalQuestion {
+  form: "ordinal"
+  instructions: string
+  levels: Array<{ key: string; criteria: string }>   // lowest first
+}
+
+interface ProbabilityQuestion {
+  form: "probability"
+  instructions: string
+  statement: string
+}
+
+type Question = ChoiceQuestion | OrdinalQuestion | ProbabilityQuestion
+```
+
+A `choice` question MUST set `options` or `optionsFrom`, not both. With
+`optionsFrom`, keys are only known at run time; `fallback` and floor
+values MUST then name a `sentinels` key, which is validated at load. An
+input whose `optionsFrom` path is missing, not an array, or yields
+duplicate keys makes every rung abstain with `invalid-input`.
+
+#### 1.1 Results
+
+```ts
+type Probabilities = Record<string, number>   // over all option keys, sums to 1 within 1e-6
+
+interface ChoiceResult      { form: "choice";      value: string;  probabilities: Probabilities }
+interface OrdinalResult     { form: "ordinal";     value: string;  probabilities: Probabilities }
+interface ProbabilityResult { form: "probability"; value: boolean; p: number }
+type Result = ChoiceResult | OrdinalResult | ProbabilityResult
+```
+
+All three forms are one computation, a distribution over options:
+`probability` is a choice over `{true, false}` with `p = P(true)`;
+`ordinal` is a choice whose options are ordered. An implementation MAY
+compute all three on one distribution path. A judge that only implements
+`choice` serves the other two through it.
+
+#### 1.2 Pick rule and confidence
+
+The engine, not the judge, turns a distribution into a `value` and a
+`confidence`. A judge MAY return a `confidence` of its own (Jev does);
+the engine records it in the trace as `judgeConfidence` and MUST NOT use
+it to decide.
+
+- **choice:** `value = argmax`, `confidence = P(value)`.
+- **probability:** `value = p >= 0.5`, `confidence = max(p, 1 - p)`. An
+  answered rung always reports `p`, even when the decision ends
+  undecided.
+- **ordinal:** the pick is set by the manifest's `pick` (§9):
+  `"conservative"` (default) or `"argmax"`. `argmax` behaves as for
+  `choice`. **Conservative:** with levels `l0 < l1 < ...`
+  and `minConfidence = c`, `value` is the lowest level `L` such that
+  `P(level <= L) >= c`, and `confidence = P(level <= L)`. In words: the
+  answer is the lightest level the judge is at least `c` sure is not too
+  light. Doubt therefore moves the answer up, never down. A rung MAY set
+  `escalateOnDoubt: true`: when the conservative pick is above the
+  argmax, the rung's answer is recorded but treated as
+  `below-threshold`, so a better judge can try before the heavier level
+  is accepted.
+
+Example: `{standard: 0.55, deep: 0.45}` with `c = 0.8` picks `deep`
+(`P(<= standard) = 0.55 < 0.8`, `P(<= deep) = 1`).
+
+#### 1.3 Final result after floor adjustment
+
+When the floor raises an ordinal answer (§4), the decision's `result`
+keeps the judge's distribution, `value` is the raised level, and
+`confidence` is recomputed as `P(level <= value)` for the raised value
+(which is at least the pre-floor confidence). The raw rung answer stays
+in the trace.
+
+#### 1.4 `extract` (reserved)
+
+`extract` (typed fields from the input, AIP-16 schema) is reserved and
+not normative in v1: no judge kind other than `llm` can serve it, and no
+calibrated per-field confidence source is specified yet. A host MUST
+reject a manifest whose question uses it until a later revision defines
+it.
+
+### 2. Judges
+
+```ts
+type JudgeKind = "rules" | "typed" | "llm" | "human"
+type Exposure = "local" | "first-party" | "third-party"
+type Calibration = "exact" | "native" | "sampled" | "self-reported"
+
+interface Judge {
+  id: string
+  kind: JudgeKind
+  forms: QuestionForm[]
+  exposure: Exposure                       // where data sent to this judge goes (§6)
+  answer(q: Question, input: unknown, ctx: JudgeContext): Promise<JudgeAnswer>
+  answerBatch?(q: Question, inputs: unknown[], ctx: JudgeContext): Promise<JudgeAnswer[]>
+}
+
+interface JudgeContext {
+  decisionId: string
+  rung: string                             // the rung's name
+  deadlineAt: number                       // epoch ms; the judge MUST answer or abstain before it
+  signal: AbortSignal
+}
+
+interface Cost { usd?: number; tokensIn?: number; tokensOut?: number; quotaUnits?: number }
+
+type JudgeAnswer =
+  | { status: "answered"; probabilities: Probabilities; calibration: Calibration;
+      judgeConfidence?: number; cost?: Cost; latencyMs: number }
+  | { status: "abstained"; reason: AbstainReason; detail?: string; cost?: Cost; latencyMs: number }
+
+type AbstainReason =
+  | "below-threshold"   // engine-set: answered under the rung's threshold, or escalateOnDoubt
+  | "unsupported-form"  // engine-set: question.form not in judge.forms; judge not called
+  | "policy-denied"     // engine-set: judge exposure exceeds the rung's maxExposure (§6)
+  | "projection-denied" // engine-set: the projection cannot be built (missing scanner, field)
+  | "circuit-open"      // engine-set: the judge is in a failure cool-down (§7)
+  | "budget-exhausted"  // engine-set: the ladder's budget would be exceeded (§7)
+  | "invalid-input"     // the input does not fit the question (e.g. optionsFrom)
+  | "no-match"          // rules judge: no rule applies
+  | "unavailable"       // network, quota, 5xx, timeout, missing credentials
+  | "invalid-output"    // the answer failed validation
+  | "self-reported"     // engine-set: calibration is self-reported and the rung does not allow it
+  | "declined"          // human judge: answered "I don't know"
+  | "expired"           // human judge: no reply before the rung's deadline
+```
+
+A Judge MUST NOT throw; every failure is an `abstained` answer. The
+engine MUST treat as `invalid-output`: probabilities over keys other than
+the question's options, probabilities that do not sum to 1, and a result
+for a form the judge does not list.
+
+**Calibration.** Every answer carries the tag of where its probabilities
+came from. A judge MUST NOT claim a tag it did not earn.
+
+| Kind | Tag | Source |
+|---|---|---|
+| `rules` | `exact` | A matching rule returns a distribution. A rule MAY return probability 1 for one option, or a declared distribution (for example from a signal score: two of three signals is not certainty). No match abstains with `no-match`. |
+| `typed` | `native` | The model's own output distribution (Jev, a reranker, an NLI model, an embedding with a classifier head). |
+| `llm` | `native` | Token log-probabilities of each full option key, summed over the key's tokenisation and renormalised over the options. Only valid when the provider exposes logprobs under the constrained output used. |
+| `llm` | `sampled` | `k >= 3` samples with temperature > 0 (or the provider's equivalent diversity control); probabilities are vote frequencies. If all `k` samples are byte-identical in their raw output, the answer is `invalid-output` (deterministic decoding, not agreement). |
+| `llm` | `self-reported` | One sample whose probabilities the model wrote. Permitted only when the rung sets `allowSelfReported: true`; otherwise the engine records the answer and abstains with `self-reported`. Metrics (§8) MUST report self-reported rungs separately. |
+| `human` | `exact` | A reply answers with probability 1; "I don't know" is `declined`; no reply is `expired`. |
+
+### 3. The ladder
+
+```ts
+interface Rung {
+  name: string                    // unique within the manifest; used in records and roles
+  judge: string                   // a registry id (§10), or "role:<role>" for an llm judge
+  mode?: "decide" | "bound" | "verify"   // default "decide"
+  minConfidence?: number          // default: the manifest's minConfidence
+  maxExposure?: Exposure          // default: the manifest's maxExposure, else "local"
+  projection?: string             // a projection id (§6); default "full"
+  timeoutMs?: number              // default 30000; human rungs: the deadline, REQUIRED
+  allowSelfReported?: boolean     // default false
+  escalateOnDoubt?: boolean       // ordinal only; default false
+  verifyAbove?: number            // verify mode only (see below)
+}
+```
+
+**Modes.**
+
+- `decide`: the rung may end the decision.
+- `bound` (ordinal only): the rung's picked level becomes a lower bound
+  for every later rung and for the fallback; the walk continues. A rules
+  judge in `bound` mode is how "rules first, and a judge may only go
+  heavier" is expressed.
+- `verify`: the rung runs only after an earlier `decide` rung has
+  decided, and only when that decision's confidence is below
+  `verifyAbove` (default 1, so always). The verifier answers the same
+  question; its result replaces the decision if it is confident enough,
+  subject to bounds, floor and direction; otherwise the decision stands.
+  The record keeps both answers. This is how "a second opinion before
+  acting" and random audits are expressed.
+
+**Escalation rule.** The engine evaluates the floor (§4), then walks the
+rungs in order, skipping `verify` rungs. For each rung:
+
+1. If the judge's circuit is open or the budget would be exceeded,
+   record the engine reason and continue.
+2. If the question's form is not in the judge's `forms`, record
+   `unsupported-form` and continue.
+3. Resolve the judge (a `role:` reference is re-resolved now, not only at
+   load). If its `exposure` exceeds the rung's `maxExposure`, record
+   `policy-denied` and continue.
+4. Build the rung's projection. On failure record `projection-denied` and
+   continue.
+5. Call the judge. If it abstains, record the reason and continue.
+6. Compute the pick and confidence (§1.2), then raise the value to the
+   current lower bound (floor `min` and earlier `bound` rungs).
+7. In `bound` mode: update the lower bound to this value and continue.
+8. In `decide` mode: if `confidence >= minConfidence` and not doubt under
+   `escalateOnDoubt`, this is the decision. Otherwise record
+   `below-threshold` and continue.
+
+After a decision, `verify` rungs that follow the deciding rung run in
+order (steps 1 to 6), each possibly replacing the decision. If no rung
+decided, the decision is the **fallback**:
+
+- for `ordinal`: the highest of the declared `fallback`, the current
+  lower bound, and every conservative pick recorded by an answered rung
+  (including below-threshold ones), with `decidedBy: "fallback"`;
+- for `choice`: the declared `fallback`;
+- for `probability`: `status: "undecided"` unless a `fallback` boolean is
+  declared.
+
+### 4. Floor and direction
+
+The floor is a list of deterministic rules evaluated before any rung.
+
+```yaml
+floor:
+  - when: { inputCount: { path: "/files", eq: 0 } }
+    set: none            # fixes the answer; no rung runs
+  - when: { anyPath: { path: "/paths", glob: ["**/migrations/**", "**/billing/**"] } }
+    min: deep            # ordinal: no answer below this level
+```
+
+- `set` and `min` values MUST be option keys or levels of the question
+  (sentinels for dynamic choices). A manifest that violates this is a
+  load error.
+- `set` ends the decision with `decidedBy: "floor"`. `min` applies to
+  `ordinal` only and sets the initial lower bound.
+- The `when` vocabulary is host-defined. Hosts MUST document their keys
+  and MUST reject a manifest that uses an unknown key. Conditions read the
+  input only; a host that needs precomputed signals puts them in the
+  input before the decision runs.
+
+`direction` (`ordinal` only):
+
+- `any` (default): a later rung or verifier may move the answer anywhere
+  at or above the current lower bound.
+- `upgrade-only`: a `verify` rung MAY raise a decision but MUST NOT lower
+  it.
+
+### 5. The decision result
+
+```ts
+interface Decision {
+  decisionId: string
+  spec: { id: string; version: string; digest: string }
+  inputDigest: string
+  status: "decided" | "undecided" | "pending"
+  result?: Result                  // present when decided
+  confidence?: number
+  decidedBy?: string               // "floor" | "fallback" | a rung name; absent when undecided or pending
+  lowerBound?: string              // ordinal: the bound in force when the decision was taken
+  floorApplied: boolean
+  rungs: RungTrace[]               // every rung consulted, in order
+  createdAt: string
+}
+
+interface RungTrace {
+  rung: string
+  judge: string                    // the resolved judge id (after role resolution)
+  kind: JudgeKind
+  mode: "decide" | "bound" | "verify"
+  exposure: Exposure
+  projection: string
+  status: "answered" | "abstained" | "skipped"   // skipped: not called (after the decision, or decision ended earlier)
+  reason?: AbstainReason
+  result?: Result                  // the rung's own pick, also kept when below threshold
+  confidence?: number
+  judgeConfidence?: number
+  calibration?: Calibration
+  latencyMs?: number
+  cost?: Cost
+  shadow?: boolean
+}
+```
+
+**Shadow.** With `shadow: true` (manifest) or `decision_run({ shadow:
+true })` (the call wins), rungs after the deciding one also run, after the
+decision is returned, and never change it. Their traces are written as
+separate `agentproto.decision.shadow/v1` lines keyed by `decisionId`
+(§8).
+
+### 6. Exposure and projections
+
+**Exposure** says where data sent to a judge ends up:
+
+- `local`: processed on this host or on an inference endpoint that
+  [AIP-61](/docs/aip-61) registers with `offering: local` (or a device
+  the user owns); nothing leaves the user's machines.
+- `first-party`: a provider the user holds a direct account or
+  subscription with, under that provider's terms.
+- `third-party`: anything else, including gateways and resellers.
+
+The judge registry (§10) declares each judge's exposure; for `llm`
+judges the host derives it from the resolved model's provider. A rung
+declares `maxExposure`. Because a role can be re-pointed by an operator
+without touching the manifest, the engine MUST check
+`judge.exposure <= rung.maxExposure` at load **and** at every call
+(step 3 of §3), and MUST record the resolved judge and its exposure in
+the trace. Re-pointing a role to a more exposed provider therefore turns
+that rung into `policy-denied` instead of silently widening who sees the
+data.
+
+**Projections** are named views of the input:
+
+```yaml
+projections:
+  metadata:
+    include: ["/counts", "/signals", "/extensions"]   # JSON pointers into the input
+  excerpts:
+    include: ["/counts", "/signals", "/addedLines"]
+    omitPaths: ["envs/**", "**/*.pem"]                 # drop input entries whose file path matches
+    redact: [secrets]                                  # named scanners
+    maxBytes: 16000
+```
+
+- A rung without `projection` receives the whole input (`full`).
+- `redact` names scanners the host provides. If a named scanner is not
+  available, building that projection fails (`projection-denied`); the
+  manifest still loads. Hosts SHOULD provide a `secrets` scanner.
+- Under the AIP-61 `local-only` privacy profile the effective
+  `maxExposure` of every rung is `local`.
+
+### 7. Health, budgets, batching, caching
+
+- **Circuit breaker.** A host MUST track consecutive `unavailable`
+  answers per judge. After `N` (default 3) within a window, the judge's
+  circuit opens for a cool-down (default 60 s); rungs using it abstain
+  with `circuit-open` without waiting. One probe call closes it on
+  success.
+- **Budget.** A manifest MAY set `budget: { maxLatencyMs?, maxUsd? }`.
+  Before calling a rung, the engine abstains with `budget-exhausted` if
+  the elapsed time plus the rung's `timeoutMs`, or the spent cost plus the
+  rung's expected cost, would exceed it. Without a budget, a synchronous
+  ladder is bounded by the sum of its rung timeouts.
+- **Batching.** `decision_run` accepts `inputs: []` and returns one
+  `Decision` per input. The engine MAY group calls to a judge that
+  implements `answerBatch`. Each decision is still recorded on its own.
+- **Caching.** A manifest MAY set `cache: { ttlMs }`. The host MAY then
+  reuse a `decided` decision for the same `(spec.digest, inputDigest)`
+  within the TTL, recording `decidedBy` of the original and
+  `cachedFrom: <decisionId>`.
+
+### 8. Execution modes, records, labels, audits
+
+**Synchronous.** A ladder without a `human` rung is a function call.
+
+**Durable.** On reaching a `human` rung the decision returns
+`status: "pending"`, is persisted, and the question is delivered through
+the host's channel. The human judge MAY use an AIP-7 approval request as
+its delivery and authentication channel; the typed answer is stored in
+the decision, not in the approval's approve/deny field. The decision
+resumes on reply, `declined` or the rung's deadline.
+
+**Records.** Every decision MUST be appended to the host's decision log
+as one `agentproto.decision.record/v1` line containing the `Decision`.
+Shadow traces are `agentproto.decision.shadow/v1` lines. Inputs are not
+stored by default; `record: { keepInput: "metadata" | "full" }` stores a
+projection, redacted at least as strictly as the strictest projection the
+ladder uses.
+
+**Labels** are ground truth attached later, one
+`agentproto.decision.label/v1` line each:
+
+```ts
+interface Label {
+  decisionId: string
+  value: string | boolean
+  source: string     // stamped by the host, never taken from the caller
+  at: string
+}
+```
+
+The host MUST stamp `source` from the authenticated caller: `human:<id>`
+for an authenticated person, `session:<id>` for a model-callable tool
+call, or a declared integration (`integration:<name>`). Metrics for a
+rung MUST exclude labels whose source is that rung's own judge. The
+answer of a `human` rung is written as a label with source `human:<id>`;
+it is excluded from that human rung's own metrics and counts for every
+other rung.
+
+**Audits.** Labels on escalated traffic alone are a biased sample (the
+hard cases). A manifest SHOULD set `audit: { rate, rung }`: for a random
+`rate` fraction of decisions not decided by `rung`, the engine also runs
+`rung` in shadow and records its answer as an audit. Calibration and
+accuracy metrics MUST be computed on audited or otherwise uniformly
+sampled decisions, and reported separately from escalated-only data.
+
+**Evaluation.** `decision_eval` computes, per `(spec.id, spec.version)`
+and per rung and calibration tag: accuracy and recall per option, a
+confusion matrix, expected calibration error, escalation rate, latency
+and cost percentiles. It runs on the log (`since`, `until`) or on a
+labelled dataset file (`dataset`), the latter being how a manifest change
+is validated before it ships.
+
+### 9. The DECISION.md manifest
+
+A decision spec is a `DECISION.md` file with `kind: decision` in its
+frontmatter. The body is free documentation.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `kind` | `"decision"` | yes | |
+| `id` | string | yes | Unique within the workspace. |
+| `version` | string | yes | Bumped on any semantic change. Metrics are per `(id, version)`; `digest` gives exact provenance. |
+| `question` | Question (§1) | yes | |
+| `ladder` | Rung[] (§3) | yes | At least one `decide` rung. Rung `name`s unique. |
+| `minConfidence` | number in (0, 1] | no, default 0.8 | |
+| `maxExposure` | Exposure | no, default `local` | Default for rungs. |
+| `floor` | FloorRule[] (§4) | no | |
+| `direction` | `"any" \| "upgrade-only"` | no, default `any` | `ordinal` only. |
+| `pick` | `"conservative" \| "argmax"` | no, default `conservative` | `ordinal` only (§1.2). `argmax` trades recall for fewer heavy outcomes; the floor still applies. |
+| `fallback` | option key, level, sentinel, or boolean | yes for `choice` and `ordinal` | |
+| `fallbackIsSafe` | boolean | see rule below | Author's statement that the fallback is acceptable on a full outage. |
+| `projections` | map (§6) | no | |
+| `shadow` | boolean | no, default false | |
+| `audit` | `{ rate: number, rung: string }` | no | |
+| `budget` | `{ maxLatencyMs?: number, maxUsd?: number }` | no | |
+| `cache` | `{ ttlMs: number }` | no | |
+| `record` | `{ keepInput?: "none" \| "metadata" \| "full" }` | no | |
+
+Validation rules (load errors):
+
+- `fallback` that is the lowest level of an `ordinal` question, or a
+  `choice` option meaning "do nothing", REQUIRES `fallbackIsSafe: true`.
+  Hosts cannot know which choice option means "do nothing", so for
+  `choice` questions `fallbackIsSafe` is REQUIRED whenever `fallback` is
+  set; for `ordinal`, only when `fallback` is the lowest level.
+- `set`, `min` and `fallback` values MUST belong to the question (§4).
+- `bound` and `escalateOnDoubt` are only valid for `ordinal`; `verify`
+  rungs MUST follow at least one `decide` rung; `verifyAbove` only on
+  `verify` rungs; `human` rungs MUST set `timeoutMs`.
+- Every judge id MUST exist in the registry; every `role:` MUST resolve
+  to an `llm` judge.
+- A ladder whose every `decide` rung lacks the question's form is a load
+  error.
+- Unknown fields are a load error.
+
+### 10. Judge registry
+
+Judges are registered with the host, not declared per manifest. A
+registry entry:
+
+```ts
+interface JudgeEntry {
+  id: string                         // "jev", "gate-rules", "owner"
+  kind: JudgeKind
+  forms: QuestionForm[]
+  exposure: Exposure                 // derived for llm judges, declared otherwise
+  config?: Record<string, unknown>   // kind-specific: rules file, endpoint, channel, sampling k
+}
+```
+
+`rules` judges load their rules from `config` (a rules file in the
+workspace). `typed` judges name an endpoint and credentials reference.
+`human` judges name a delivery channel and the principal allowed to
+answer.
+
+**Roles.** `role:` references resolve `llm` judges only: the role names
+a model, the host wraps it as an `llm` judge with its configured
+calibration method, and derives `exposure` from the model's provider.
+Hosts SHOULD use the role name `decision.<spec-id>.<rung-name>` and fall
+back to `decision.default`. `typed`, `rules` and `human` judges are
+referenced by registry id; swapping Jev for a local head is a registry
+change, not a role change.
+
+### 11. Host surface
+
+| Surface | Contract |
+|---|---|
+| `decision_run({ spec, input \| inputs, shadow? })` | Runs one decision or a batch. `pending` for durable ones. |
+| `decision_resume({ decisionId, answer })` | Delivers a human answer; the caller must be the principal the human judge names. |
+| `decision_label({ decisionId, value })` | Appends a label; the host stamps `source`. |
+| `decision_eval({ spec, since?, until?, dataset? })` | §8 metrics. |
+| `decision_judges()` | Lists registry entries with circuit state. |
+| Workflow step `kind: "decide"` | Fields: `spec`, `input`. The step's output is the `Decision`, bound at `$steps.<id>`. With a `human` rung the step is suspendable. Branching uses `branch`. |
+| CLI | `agentproto decide run <spec> --input <file>`, `decide eval <spec> [--dataset <file>]`, `decide report <spec>` (rung agreement, shadow and audits). |
+
+## Example
+
+The push gate decides a git range's review tier. The input carries
+precomputed facts (`files`, `paths`, `counts`, `signals`, `extensions`,
+`addedLines`). Rules bound the answer, Jev and then an LLM on a
+first-party subscription sees the same excerpts.
+
+```yaml
+---
+kind: decision
+id: review-range
+version: "1"
+question:
+  form: ordinal
+  instructions: "How much review does this git range need before it is pushed?"
+  levels:
+    - { key: none,     criteria: "empty range, or only files already reviewed" }
+    - { key: light,    criteria: "docs, lockfiles, images; no runtime behaviour changes" }
+    - { key: standard, criteria: "ordinary code change with no risk signal" }
+    - { key: deep,     criteria: "auth, billing, migrations, CI, secrets, the gate itself, or a large surface" }
+floor:
+  - { when: { inputCount: { path: "/files", eq: 0 } }, set: none }
+  - { when: { anyPath: { path: "/paths", glob: ["**/migrations/**", "**/billing/**", ".github/workflows/**", "**/REVIEW.md"] } }, min: deep }
+ladder:
+  - { name: rules,  judge: gate-rules, mode: bound }
+  - { name: jev,    judge: jev, projection: excerpts, maxExposure: third-party, minConfidence: 0.85, escalateOnDoubt: true }
+  - { name: llm,    judge: "role:decision.review-range.llm", projection: excerpts, maxExposure: first-party, allowSelfReported: true }
+direction: upgrade-only
+fallback: standard
+shadow: true
+audit: { rate: 0.1, rung: llm }
+budget: { maxLatencyMs: 20000 }
+projections:
+  excerpts:
+    include: ["/counts", "/signals", "/addedLines"]
+    omitPaths: ["envs/**"]
+    redact: [secrets]
+    maxBytes: 16000
+---
+```
+
+A task tracker decides what an inbound message does to open tasks; the
+candidate tasks come from the input, and the owner is the last rung.
+
+```yaml
+---
+kind: decision
+id: task-target
+version: "1"
+question:
+  form: choice
+  instructions: "Which open task, if any, does this message belong to?"
+  optionsFrom: { path: "/candidates", key: "id", criteria: "title", max: 5 }
+  sentinels:
+    new:  "asks for work that matches no listed task"
+    none: "no task-relevant content"
+ladder:
+  - { name: rules, judge: triage-rules }
+  - { name: llm,   judge: "role:decision.task-target.llm", maxExposure: first-party }
+  - { name: owner, judge: owner, timeoutMs: 43200000 }
+fallback: none
+fallbackIsSafe: true
+---
+```
+
+## Rationale
+
+**One primitive for rules, models and humans.** The consumers above
+already mix them. With the same contract for each kind, the ladder is
+data and its order is a config change.
+
+**Kinds, forms and exposure instead of separate primitives.** The
+contract is the same for a typed model and an LLM; what differs is where
+probabilities come from (the calibration tag) and where data goes (the
+exposure class). Encoding those two lets the engine compare answers and
+enforce privacy without splitting the primitive.
+
+**Conservative ordinal pick.** Both downstream routers already say "when
+unsure, choose the heavier". An argmax with a threshold sends honest
+doubt to the fallback, which is usually the lighter default. The quantile
+pick turns doubt into a heavier level, and `escalateOnDoubt` lets a
+better judge try first.
+
+**Bound and verify modes.** A rung that decides at probability 1 ends the
+ladder, so "rules first, judges may only go heavier" cannot be expressed
+with decide rungs alone. `bound` expresses it. The steward's analysis
+re-checks confident answers before acting; `verify` expresses that, and
+also random audits.
+
+**Analyze and act stay out.** They are workflow steps around a decision.
+The primitive stays a typed answer, usable by a router that needs nothing
+else.
+
+**`extract` reserved.** No judge kind except an LLM can serve it today,
+and per-field calibration is unsolved. Reserving it keeps the form
+namespace stable without promising semantics.
+
+**No attestation.** Most decisions are local and short-lived. A review
+that consumes one records its id (see the AIP-62 amendment below).
+
+**Rejected names.** JUDGE names the provider. CLASSIFY excludes the
+forms that are not classification and is a common role key (an example
+key in AIP-57). TRIAGE is too narrow. VERDICT is AIP-62's term. ORACLE is
+used downstream with a different meaning. AIP-62 also has an agent-lane
+field named `decision` (`approve | request_changes`); the two are
+distinguishable by context, and this AIP never uses the bare word as a
+field name inside a review.
+
+## Reference implementation
+
+Not yet implemented as specified. The reference runtime has the pieces it
+is extracted from: the session steward workflows
+(`packages/apps/session-steward/.agentproto/workflows/session-steward/actions.mjs`,
+`two-step.mjs`, `docs/cli/verbs/steward.md`), the Jev client
+(`packages/runtime/src/jev-client.ts`, `choice` only, never throws,
+bounded retries), and model roles (`packages/runtime/src/model-roles.ts`).
+
+Known gaps the implementation must close: the runtime has no raw
+structured-output model call and no logprob access (its LLM judging runs
+through harness sessions), so `llm` judges need a completion path before
+`native` or `sampled` calibration is possible; and it has no content
+secret scanner, so `redact: [secrets]` projections fail until one exists.
+
+## Backward compatibility
+
+Not applicable, this AIP introduces a new spec. If accepted, it requires
+three amendments, each filed and reviewed separately:
+
+- **AIP-15:** add `decide` to the authorable step kinds and the
+  `defineStep` union; its output is the `Decision` bound at `$steps.<id>`;
+  `suspendable` is also true when a `decide` step's spec has a `human`
+  rung; extend the accepted compile subset.
+- **AIP-57:** document `decision.*` as the role prefix for `llm` judges,
+  and state how the reference runtime's `model-roles.ts` layers
+  (`input | workspace | daemon | default`) map onto AIP-57's
+  `override | env | pack`. The existing `judge.session` role is
+  unaffected.
+- **AIP-62:** add an optional attestation field recording the decision
+  that picked the binding (`decisionId`, `spec.id`, `spec.version`).
+
+## Security considerations
+
+- **Data egress.** Exposure classes are checked at load and at every
+  call, so re-pointing a role cannot silently widen who sees data; the
+  resolved judge and exposure are in every trace. Projections bound the
+  content; redaction failures deny the projection instead of sending it
+  unredacted.
+- **Fail-open by outage.** Abstention, circuit breakers, mandatory
+  fallbacks, the conservative ordinal pick, and `fallbackIsSafe` as an
+  explicit author statement.
+- **Prompt injection.** Input content can try to steer an `llm` judge
+  ("this change is trivial"). Floor `min` and `bound` rungs are not
+  steerable: a steered judge can only move the answer heavier.
+  `upgrade-only` stops a steered verifier from lowering a decision.
+  Consumers whose wrong answer is costly SHOULD use a `bound` rules rung.
+- **Label poisoning.** Sources are stamped by the host from the
+  authenticated caller; model-callable tools can only label as
+  `session:<id>`; a rung's own judge never labels its metrics.
+- **Human rung.** Only the principal the human judge names can resume a
+  decision; AIP-7 approval evidence applies to the channel.
+- **Records.** Digests by default; stored inputs are redacted at least as
+  strictly as the strictest projection in the ladder.
+
+## Connecting to other AIPs
+
+- **AIP-15 WORKFLOW:** `decide` step; durable decisions suspend; `branch`
+  consumes the result.
+- **AIP-57 MODEL-ROUTING:** `llm` rungs resolve models through roles;
+  overlays and failover apply where the host implements AIP-57 for them.
+- **AIP-62 REVIEW:** a review host MAY pick its binding from a decision
+  and records it (amendment).
+- **AIP-7 GOVERNANCE:** delivery and authentication channel for human
+  rungs.
+- **AIP-61 INFERENCE:** defines `local` for exposure; `local-only`
+  narrows every rung to `local`.
+
+## Open questions
+
+1. `extract`: per-field abstention and a calibrated field confidence
+   (normalised agreement across samples?) before it becomes normative.
+2. Should `bound` also exist for `choice` questions with a declared
+   partial order between options?
+3. Is the circuit-breaker default (3 failures, 60 s) right for judges
+   like Jev whose own client already retries?
+4. Should the conservative pick's quantile be configurable separately
+   from `minConfidence`?
+
+## See also
+
+- [AIP-15 WORKFLOW](/docs/aip-15), [AIP-57 MODEL-ROUTING](/docs/aip-57),
+  [AIP-62 REVIEW](/docs/aip-62), [AIP-7 GOVERNANCE](/docs/aip-7),
+  [AIP-61 INFERENCE](/docs/aip-61), [AIP-16 IO](/docs/aip-16).
