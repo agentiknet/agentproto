@@ -1,0 +1,221 @@
+---
+title: "AIP-66: Managed cloud agents (the `cloud:<vendor>` execution target)"
+description: "Names a third execution target for an agent session, next to the host and an AIP-36 sandbox: a managed cloud agent, where the vendor owns both the machine and the harness and no agentproto daemon runs inside. Fixes the vendor to harness binding, the repo-source rule (a git remote and ref, never an uploaded working tree), the spawn fields a host refuses for this target, the 1:1 session identity and re-attach rule, the lifecycle verbs (start, prompt, observe, stop, pull), usage reporting, and credential handling. Informative appendix: the Anthropic Claude Code cloud mapping."
+aip: 66
+status: Draft
+type: Core
+created: 2026-10-14
+author: Jeremy André <jeremy@agentik.net>
+requires: [1, 36, 44, 45]
+layer: runtime
+package: "@agentproto/runtime"
+ref-impl: https://github.com/agentproto/ts/tree/main/adapters/claude-code-cloud
+---
+
+| Field | Value |
+|---|---|
+| AIP | 66 (provisional, editors assign the final number) |
+| Title | Managed cloud agents: the `cloud:<vendor>` execution target |
+| Author | Jeremy André &lt;jeremy@agentik.net&gt; |
+| Status | Draft |
+| Type | Core |
+| Requires | [AIP-1](/docs/aip-1) (process), [AIP-36](/docs/aip-36) (SANDBOX: the target this one is distinguished from), [AIP-44](/docs/aip-44) (ACP: the wire a cloud session is projected onto), [AIP-45](/docs/aip-45) (AGENT-CLI: the harness manifest a vendor binds to) |
+| Created | 2026-10-14 |
+| Package | `@agentproto/runtime` (spawn resolution, vendor registry, re-attach); `@agentproto/adapter-claude-code-cloud` (first vendor) |
+
+## Abstract
+
+An agentproto host runs an agent session in one of three places:
+
+| Target | Who owns the machine | Who picks the harness | agentproto daemon inside |
+|---|---|---|---|
+| `local` | the host | the caller | yes (the host itself) |
+| `sandbox:<provider>` ([AIP-36](/docs/aip-36)) | a provider or the host | the caller | yes |
+| `cloud:<vendor>` (this AIP) | the vendor | **the vendor** | **no** |
+
+A **managed cloud agent** is a session that a vendor hosts end to end:
+the vendor boots the machine, runs its own harness in it, and exposes the
+session through its own client and API. Examples: Claude Code cloud
+sessions (Anthropic), Codex cloud tasks (OpenAI).
+
+This AIP fixes how a host exposes such a session as an ordinary agentproto
+session (listed, promptable, observable, with turn ends and usage), and
+what it MUST refuse, given that it controls neither the machine nor the
+harness.
+
+## Motivation
+
+AIP-36 assumes the host boots a box and installs its own daemon and the
+caller's chosen harness inside it. A managed cloud agent breaks both
+assumptions: nothing can be installed in it, and the harness is fixed by
+the vendor. Modelling it as a sandbox provider would make `boot()` lie and
+would let callers pass fields (`installAdapters`, `mounts`, `network`) that
+can never take effect.
+
+The value is real anyway: the vendor's compute and credits, a session the
+user can also open in the vendor's own UI, and no box to keep alive. So it
+gets its own target with an honest, smaller contract.
+
+## Specification
+
+### 1. The target
+
+A spawn names the target with a vendor slug:
+
+```ts
+agent_start({ adapter: "claude-code", cloud: "anthropic", prompt: "..." })
+```
+
+- `cloud` is a vendor slug from the host's **vendor registry**.
+- `cloud` and `sandbox` are mutually exclusive. A spawn that sets both
+  MUST be refused.
+- AIP-36 is not extended by this AIP. A `sandbox` provider MUST NOT be
+  used to represent a managed cloud agent.
+
+### 2. Vendor to harness binding
+
+Each registry entry declares the harness or harnesses the vendor runs and
+the adapter that relays to it:
+
+```ts
+interface CloudVendor {
+  slug: string            // "anthropic"
+  harnesses: string[]     // ["claude-code"]
+  adapter: string         // "claude-code-cloud"
+}
+```
+
+- When `adapter` (or its alias `harness`) is set and is not in
+  `harnesses`, and is not the vendor's relay `adapter` itself, the host
+  MUST refuse the spawn **before any side effect**, with an error that
+  names the vendor and the allowed harnesses.
+- When `adapter` is unset, the host resolves it to the vendor's relay
+  adapter.
+- An unknown vendor slug MUST be refused, never mapped to a default.
+
+### 3. Repo source
+
+A managed cloud agent runs on a **git remote and ref**, not on a host path.
+
+- The host resolves the spawn's `cwd` (or workspace) to its git remote and
+  the commit at `HEAD`.
+- The host MUST refuse the spawn when the working tree is dirty or when
+  `HEAD` is not reachable from the remote. It MUST NOT let a vendor client
+  upload a local working tree as a fallback.
+- A `cwd` that is not a git checkout with a remote MUST be refused.
+
+### 4. Refused spawn fields
+
+The following fields have no meaning for this target. A host MUST refuse a
+`cloud` spawn that sets any of them, rather than ignore them:
+
+`sandbox`, `worktree`, `commandSandbox`, `mcpServers`, `daemonMount`,
+`bundles`, `browser`, `appServe`, `inference`.
+
+A host MAY support a vendor-specific subset of `model`, `effort` and
+`mode` when the vendor client accepts them, and MUST refuse a value the
+vendor cannot apply.
+
+### 5. Session identity and re-attach
+
+- One agentproto session maps to exactly one vendor session.
+- The host MUST persist the mapping on the session descriptor as
+  `meta.cloud = { vendor, sessionId, url }` as soon as the vendor returns
+  the id.
+- After a host restart, a session whose descriptor carries `meta.cloud`
+  MUST be re-attached to the same vendor session. The host MUST NOT start
+  a new vendor session to replace it.
+
+### 6. Lifecycle verbs
+
+| Verb | Meaning | Required |
+|---|---|---|
+| start | create the vendor session with the first prompt | MUST |
+| prompt | send a follow-up turn to the same vendor session | MUST |
+| observe | read the vendor's events until the turn ends | MUST |
+| stop | end or archive the vendor session | SHOULD |
+| pull | bring the session to the host as a local session (e.g. Claude Code `--teleport`) | MAY |
+| cancel | interrupt the running turn | MAY; a host without a vendor verb MUST report it unsupported |
+
+The session is projected onto ACP ([AIP-44](/docs/aip-44)): the vendor's
+events become agent message chunks and tool call updates, and the
+vendor's own end-of-turn event ends the ACP prompt. A turn MUST NOT be
+reported as ended on a timer or on silence alone.
+
+### 7. Usage
+
+- When the vendor's end-of-turn event carries cost or token usage, the
+  host MUST report it as the turn's usage.
+- When it does not, the host MUST mark usage as **unmeasured**. It MUST
+  NOT report zero.
+
+### 8. Credentials
+
+- The vendor login (typically OAuth, owned by the vendor's client) is the
+  credential. The host MUST NOT copy it into session descriptors, logs,
+  events or transcripts.
+- The host MUST remove from the vendor client's environment any variable
+  that would make the client use a different credential (for Anthropic:
+  `ANTHROPIC_API_KEY`, plus provider redirect toggles).
+- When the vendor login is missing, the spawn MUST fail with an error that
+  tells the user how to log in.
+
+## Conformance
+
+A conformant host:
+
+1. refuses a harness the vendor does not run, before any side effect;
+2. refuses `cloud` together with `sandbox` or any field of section 4;
+3. refuses a dirty or unpushed repo and never uploads a working tree;
+4. persists `meta.cloud` and re-attaches after a restart;
+5. ends a turn only on the vendor's end-of-turn event;
+6. reports vendor usage, or marks it unmeasured;
+7. never exposes the vendor credential.
+
+## Appendix A (informative): Anthropic, Claude Code cloud sessions
+
+Observed with Claude Code CLI 2.1.296 to 2.1.299 (2026-10-14). These are
+vendor surfaces, partly undocumented, and may change.
+
+| Verb | Mapping |
+|---|---|
+| start | `claude --cloud "<prompt>"`, which requires a TTY; prints the session id (`session_<id>`) and URL, then exits |
+| prompt | `claude -p "<text>" --cloud <session id>`; no TTY; send-only (does not return the reply) |
+| observe | `GET https://api.anthropic.com/v1/code/sessions/{id}/events` (newest first, `resume_cursor`); events use the Claude Code stream-json format; the `result` event ends a turn and carries `total_cost_usd` and `usage`. A streaming variant exists at `/events/stream`. |
+| state | `GET /v1/code/sessions/{id}`: `status_bucket`, `worker_status`, `last_event_at`, `session_url` |
+| list | `GET /v1/code/sessions`; ids appear as `cse_<id>`, same suffix as `session_<id>` |
+| pull | `claude --teleport <session id>` |
+
+Requests carry `Authorization: Bearer <claude.ai OAuth access token>`,
+`anthropic-version: 2023-06-01` and `x-organization-uuid`. The CLI refuses
+cloud sessions when it is authenticated by an API key, and refuses to
+upload a working tree whose git object store holds lock files or
+hardlinked objects, which section 3 makes moot.
+
+## Security considerations
+
+- The vendor runs code from the user's repo on the vendor's machines, with
+  the vendor's network policy. Hosts SHOULD surface the session URL so the
+  user can inspect what ran.
+- Section 3 exists to stop silent exfiltration of uncommitted files,
+  local secrets and gitignored content through a vendor upload path.
+- The OAuth credential grants broad account access. Section 8 forbids
+  persisting it anywhere the host writes.
+- Vendor APIs used in Appendix A are undocumented: a host SHOULD pin the
+  vendor client version it was tested with and fail closed on unknown
+  event shapes.
+
+## Open questions
+
+1. **Prompting through the API.** Whether follow-up turns can be posted to
+   the sessions API directly, removing the CLI from the prompt path.
+2. **Streaming.** Whether `/events/stream` should replace polling as the
+   default observe path.
+3. **Second vendor.** Codex cloud tasks are expected to fit sections 1 to
+   8 unchanged; to be confirmed when its adapter lands.
+
+## See also
+
+- [AIP-36: SANDBOX.md](/docs/aip-36): host-controlled compute, the target this one is not
+- [AIP-44: ACP.md](/docs/aip-44): the wire a cloud session is projected onto
+- [AIP-45: AGENT-CLI.md](/docs/aip-45): the harness manifests a vendor binds to
