@@ -112,6 +112,14 @@ The following fields have no meaning for this target. A host MUST refuse a
 `sandbox`, `worktree`, `commandSandbox`, `mcpServers`, `daemonMount`,
 `bundles`, `browser`, `appServe`, `inference`.
 
+A field set to its neutral value counts as unset and is not refused:
+`commandSandbox: "off"`, `browser: false`, `daemonMount: false`, and an
+empty `mcpServers` or `bundles` list.
+
+The refusal names the offending field. The relay adapter SHOULD repeat
+the `mcpServers` check when the session is created, so that a host that
+forwards the field anyway still fails closed.
+
 A host MAY support a vendor-specific subset of `model`, `effort` and
 `mode` when the vendor client accepts them, and MUST refuse a value the
 vendor cannot apply.
@@ -125,6 +133,18 @@ vendor cannot apply.
 - After a host restart, a session whose descriptor carries `meta.cloud`
   MUST be re-attached to the same vendor session. The host MUST NOT start
   a new vendor session to replace it.
+- The vendor id usually exists only after the first prompt reaches the
+  vendor, which can be long after the spawn. The host MUST keep waiting for
+  it for as long as the session is alive, not for a fixed delay. How the
+  relay hands the id to the host is implementation-defined (Appendix A
+  shows one way).
+- Re-attach goes through the harness wire's own resume verb, carrying the
+  **vendor** session id rather than the host's or the wire's own id. For an
+  ACP relay ([AIP-44](/docs/aip-44)) that verb is `session/load`. On load,
+  the relay adopts the vendor session, and the next prompt is a follow-up
+  turn on it.
+- A relay that is asked to load an id the vendor could not have issued
+  MUST fail the load. It MUST NOT start a new vendor session in its place.
 
 ### 6. Lifecycle verbs
 
@@ -141,6 +161,16 @@ The session is projected onto ACP ([AIP-44](/docs/aip-44)): the vendor's
 events become agent message chunks and tool call updates, and the
 vendor's own end-of-turn event ends the ACP prompt. A turn MUST NOT be
 reported as ended on a timer or on silence alone.
+
+A turn ends only on an end-of-turn event emitted **after** that turn's
+prompt. After a re-attach, the vendor's history already holds earlier
+end-of-turn events, and the relay MUST NOT end the next turn on any of
+them. The relay SHOULD therefore mark the whole existing history as seen,
+across every page, before sending the first prompt after the load.
+
+A transient read failure while observing (a network error or a vendor
+5xx) SHOULD be retried with backoff before the turn is failed. The vendor
+keeps working whether or not the host is reading.
 
 ### 7. Usage
 
@@ -167,8 +197,11 @@ A conformant host:
 1. refuses a harness the vendor does not run, before any side effect;
 2. refuses `cloud` together with `sandbox` or any field of section 4;
 3. refuses a dirty or unpushed repo and never uploads a working tree;
-4. persists `meta.cloud` and re-attaches after a restart;
-5. ends a turn only on the vendor's end-of-turn event;
+4. persists `meta.cloud`, waits for the vendor id for as long as the
+   session is alive, and re-attaches after a restart through the wire's
+   resume verb with the vendor id, never by starting a new vendor session;
+5. ends a turn only on an end-of-turn event emitted after that turn's
+   prompt, never on one already in the history;
 6. reports vendor usage, or marks it unmeasured;
 7. never exposes the vendor credential.
 
@@ -191,6 +224,24 @@ Requests carry `Authorization: Bearer <claude.ai OAuth access token>`,
 cloud sessions when it is authenticated by an API key, and refuses to
 upload a working tree whose git object store holds lock files or
 hardlinked objects, which section 3 makes moot.
+
+### Reference implementation (agentproto/ts)
+
+- **Relay.** `@agentproto/adapter-claude-code-cloud` is an ACP stdio relay
+  ([agentproto/ts#1947](https://github.com/agentproto/ts/pull/1947)). It
+  reuses the stream-json to ACP mapping of `@agentproto/adapter-claude-sdk`.
+- **Spawn wiring.** `@agentproto/runtime` adds a vendor registry and
+  `resolveCloudSpawn`. It refuses §2 and §4 violations before any side
+  effect, with the code `cloud_spawn_refused`
+  ([agentproto/ts#1950](https://github.com/agentproto/ts/pull/1950)).
+- **Id handoff (§5).** The host passes the relay a file path through
+  `AGENTPROTO_CLOUD_SESSION_META_FILE`, inside the session's isolated
+  config directory. Once the vendor returns the id, the relay writes
+  exactly `{ vendor, sessionId, url }` to that file, and never a
+  credential. The host watches the file while the session is alive and
+  merges it into `meta.cloud`. On resume, it reads the id from
+  `meta.cloud`, or from the file if the merge never happened, and passes it
+  to ACP `session/load`.
 
 ## Security considerations
 
